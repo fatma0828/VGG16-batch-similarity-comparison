@@ -3,7 +3,6 @@
 Created on Wed Oct 18 20:14:55 2023
 
 @author: matt
-@specialthanksto: Yuuma
 """
 from multiprocessing import set_start_method
 import multiprocessing
@@ -20,14 +19,14 @@ import logging
 from os import getpid
 import warnings
 import time
+import math
 
 
-# Logger for each processor
+# Function to set up the logger in each process
 def setup_process_logger():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
 
 
-# Main extract function using the VGG16 model
 def extract(img, layer_name, base_model):
     # Load image
     img = load_img(img)
@@ -45,7 +44,6 @@ def extract(img, layer_name, base_model):
     return feature / np.linalg.norm(feature)
 
 
-# Main thread function for each processor
 def thread_function(in_queue, out_queue):
     setup_process_logger()
 
@@ -95,7 +93,7 @@ if __name__ == '__main__':
     # Filter all warning messages
     warnings.filterwarnings("ignore")
     tf.get_logger().setLevel('FATAL')
-    # Manual fix for multiprocessing deadlock bug in old Python versions. This is not needed in versions where the fork() issue is fixed.
+    # Manual fix for multiprocessing deadlock bug in old Python versions
     set_start_method("spawn")
 
     # IMGPATH MAKER start
@@ -157,83 +155,84 @@ if __name__ == '__main__':
 
             img2 = image_names[j]
 
-            if img1 == img2:
+            if os.path.dirname(imgpoolpaths[i]) == os.path.dirname(imgpoolpaths[j]):    # No need to compare within dir
                 continue
 
             # Check if the tuple already exists in finalresults
             if (img1, img2) in finalresults or (img2, img1) in finalresults:
-                print(f"Skipping {img1} and {img2}.")
                 continue
 
             missionlist.append((imgpoolpaths[i], imgpoolpaths[j]))
 
-    # For debugging: print(missionlist)
+    print(f"Mission: {len(missionlist)}")
 
     # MISSION LIST end
 
-    # Main worker distribution code
-    num_workers = 25    # Set number of workers; be careful of system load
-    write_threshold = 100    # Will write to file per X lines
-
+    # New code block start
+    num_workers = 15
+    write_threshold = 50
     in_queue_list = [multiprocessing.Queue() for i in range(num_workers)]
     out_queue = multiprocessing.Queue()
 
     p_list = [multiprocessing.Process(target=thread_function, args=(in_queue_list[i], out_queue)) for i in range(num_workers)]
     [p.start() for p in p_list]
 
-    time0 = time.time()    # For evaluation time usage only
-
-    # Distributing tasks
     for i, mission in enumerate(missionlist):
         in_queue_list[i % num_workers].put(mission)
 
-    # Adding end signal to all workers in the end
     [in_queue_list[i].put(None) for i in range(num_workers)]
 
-    # Fetching results from queue
     out_list = []
 
-    for i in range(len(missionlist)):
-        out_list.append(out_queue.get())
-        print("out_list appended")
+    batch_size = 100  # Adjust the batch size as needed
 
-        # Write to file per X lines
-        if len(out_list) >= write_threshold:
-            print("write threshold triggered")
-            # Write results to file
-            for result in out_list:
-                # Create a DataFrame from the calculated distances
-                df = pd.DataFrame(result).T
+    # Calculate the number of batches
+    num_batches = math.ceil(len(missionlist) / batch_size)
 
-                # Fill NaN values with an empty dictionary
-                df.fillna({}, inplace=True)
+    for batch_num in range(num_batches):
+        start_index = batch_num * batch_size
+        end_index = min((batch_num + 1) * batch_size, len(missionlist))
 
-                if os.path.isfile(input_csv_file):
-                    df.to_csv(input_csv_file, mode='a', header=False)
-                else:
-                    df.to_csv(input_csv_file)
-            # Clear out_arr
-            out_list = []
+        time0 = time.time()
 
-    # Write remaining lines to file
-    if len(out_list):
-        print(f"Writing last {len(out_list)} entries.")
-        # Write results to file
-        for result in out_list:
-            # Create a DataFrame from the calculated distances
-            df = pd.DataFrame(result).T
+        for i in range(start_index, end_index):
+            out_list.append(out_queue.get())
 
-            # Fill NaN values with an empty dictionary
-            df.fillna({}, inplace=True)
+            if len(out_list) >= write_threshold:
+                print("write threshold triggered")
+                # Write results to file
+                for result in out_list:
+                    # Create a DataFrame from the calculated distances
+                    df = pd.DataFrame(result).T
 
-            if os.path.isfile(input_csv_file):
-                df.to_csv(input_csv_file, mode='a', header=False)
-            else:
-                df.to_csv(input_csv_file)
+                    # Fill NaN values with an empty dictionary
+                    df.fillna({}, inplace=True)
 
-    # End multiprocessing pool
-    print("p join starting")
-    [p.join() for p in p_list]
+                    if os.path.isfile(input_csv_file):
+                        df.to_csv(input_csv_file, mode='a', header=False)
+                    else:
+                        df.to_csv(input_csv_file)
+                # Clear out_arr
+                out_list = []
+
+        print("p join starting")
+        [p.join() for p in p_list]
+        time.sleep(60)
+
+#    if len(out_list):
+#        print(f"Writing last {len(out_list)} entries.")
+#        # Write results to file
+#        for result in out_list:
+#            # Create a DataFrame from the calculated distances
+#            df = pd.DataFrame(result).T
+#
+#            # Fill NaN values with an empty dictionary
+#            df.fillna({}, inplace=True)
+#
+#            if os.path.isfile(input_csv_file):
+#                df.to_csv(input_csv_file, mode='a', header=False)
+#            else:
+#                df.to_csv(input_csv_file)
 
     # Calculate the elapsed time
     elapsed_time = time.time() - time0
