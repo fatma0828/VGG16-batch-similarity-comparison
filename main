@@ -6,6 +6,7 @@ Created on Wed Oct 18 20:14:55 2023
 """
 from multiprocessing import set_start_method
 import multiprocessing
+import threading
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
@@ -27,7 +28,7 @@ def setup_process_logger():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
 
 
-def extract(img, layer_name, base_model):
+def extract(img, model):
     # Load image
     img = load_img(img)
     # Resize the image
@@ -39,9 +40,10 @@ def extract(img, layer_name, base_model):
     x = np.expand_dims(x, axis=0)
     x = preprocess_input(x)
     # Extract Features
-    model = Model(inputs=base_model.input, outputs=base_model.get_layer(layer_name).output)
-    feature = model.predict(x)[0]
-    return feature / np.linalg.norm(feature)
+    # model = Model(inputs=base_model.input, outputs=base_model.get_layer(layer_name).output)
+    feature = model.predict(x)
+    return feature
+    # return feature / np.linalg.norm(feature)
 
 
 def thread_function(in_queue, out_queue):
@@ -49,8 +51,22 @@ def thread_function(in_queue, out_queue):
 
     base_model = VGG16(weights='imagenet')
 
-    layernames = ['block1_conv1', 'block1_pool', 'block2_pool', 'block3_conv3', 'block3_pool', 'block4_conv1',
-                  'block4_pool', 'block5_pool', 'flatten', 'fc1', 'fc2']
+    layernames = [
+        'block1_conv1',
+        'block1_pool',
+        'block2_pool',
+        'block3_conv3',
+        'block3_pool',
+        'block4_conv1',
+        'block4_pool',
+        'block5_pool',
+        'flatten',
+        'fc1',
+        'fc2'
+    ]
+
+    layer_outputs = [base_model.get_layer(layer_name).output for layer_name in layernames]
+    model = Model(inputs=base_model.input, outputs=layer_outputs)
 
     while True:
         in_arr = in_queue.get()
@@ -62,12 +78,11 @@ def thread_function(in_queue, out_queue):
             # Set up dict
             feature_values1 = {}
             feature_values2 = {}
-            for layers in layernames:
-                img_feature1 = extract(img1, layers, base_model)
-                feature_values1[layers] = img_feature1
-
-                img_feature2 = extract(img2, layers, base_model)
-                feature_values2[layers] = img_feature2
+            img_feature1 = extract(img1, model)
+            img_feature2 = extract(img2, model)
+            for i in range(len(layernames)):
+                feature_values1[layernames[i]] = img_feature1[i][0] / np.linalg.norm(img_feature1[i][0])
+                feature_values2[layernames[i]] = img_feature2[i][0] / np.linalg.norm(img_feature2[i][0])
 
             # Calculate distances
             euclidean_distances = {}
@@ -94,7 +109,7 @@ if __name__ == '__main__':
     warnings.filterwarnings("ignore")
     tf.get_logger().setLevel('FATAL')
     # Manual fix for multiprocessing deadlock bug in old Python versions
-    set_start_method("spawn")
+    # set_start_method("spawn")
 
     # IMGPATH MAKER start
     directory = os.getcwd()  # Specify the directory path HERE
@@ -164,6 +179,10 @@ if __name__ == '__main__':
 
             missionlist.append((imgpoolpaths[i], imgpoolpaths[j]))
 
+    # loop_num = 10
+    # for i in range(loop_num):
+    #     missionlist.append(('images/000.jpg', 'images/000.jpg'))
+
     print(f"Mission: {len(missionlist)}")
 
     # MISSION LIST end
@@ -171,68 +190,38 @@ if __name__ == '__main__':
     # New code block start
     num_workers = 15
     write_threshold = 50
-    in_queue_list = [multiprocessing.Queue() for i in range(num_workers)]
+    in_queue_list = [multiprocessing.Queue(maxsize=128) for i in range(num_workers)]
     out_queue = multiprocessing.Queue()
 
     p_list = [multiprocessing.Process(target=thread_function, args=(in_queue_list[i], out_queue)) for i in range(num_workers)]
     [p.start() for p in p_list]
 
-    for i, mission in enumerate(missionlist):
-        in_queue_list[i % num_workers].put(mission)
+    def input_fn():
+        for i, mission in enumerate(missionlist):
+            in_queue_list[i % num_workers].put(mission)
 
-    [in_queue_list[i].put(None) for i in range(num_workers)]
+        [in_queue_list[i].put(None) for i in range(num_workers)]
 
-    out_list = []
+    input_thread = threading.Thread(target=input_fn)
+    input_thread.start()
 
-    batch_size = 100  # Adjust the batch size as needed
+    time0 = time.time()
 
-    # Calculate the number of batches
-    num_batches = math.ceil(len(missionlist) / batch_size)
+    for _ in range(len(missionlist)):
+        result = out_queue.get()
+        # Create a DataFrame from the calculated distances
+        df = pd.DataFrame(result).T
 
-    for batch_num in range(num_batches):
-        start_index = batch_num * batch_size
-        end_index = min((batch_num + 1) * batch_size, len(missionlist))
+        # Fill NaN values with an empty dictionary
+        df.fillna({}, inplace=True)
 
-        time0 = time.time()
+        if os.path.isfile(input_csv_file):
+            df.to_csv(input_csv_file, mode='a', header=False)
+        else:
+            df.to_csv(input_csv_file)
 
-        for i in range(start_index, end_index):
-            out_list.append(out_queue.get())
-
-            if len(out_list) >= write_threshold:
-                print("write threshold triggered")
-                # Write results to file
-                for result in out_list:
-                    # Create a DataFrame from the calculated distances
-                    df = pd.DataFrame(result).T
-
-                    # Fill NaN values with an empty dictionary
-                    df.fillna({}, inplace=True)
-
-                    if os.path.isfile(input_csv_file):
-                        df.to_csv(input_csv_file, mode='a', header=False)
-                    else:
-                        df.to_csv(input_csv_file)
-                # Clear out_arr
-                out_list = []
-
-        print("p join starting")
-        [p.join() for p in p_list]
-        time.sleep(60)
-
-#    if len(out_list):
-#        print(f"Writing last {len(out_list)} entries.")
-#        # Write results to file
-#        for result in out_list:
-#            # Create a DataFrame from the calculated distances
-#            df = pd.DataFrame(result).T
-#
-#            # Fill NaN values with an empty dictionary
-#            df.fillna({}, inplace=True)
-#
-#            if os.path.isfile(input_csv_file):
-#                df.to_csv(input_csv_file, mode='a', header=False)
-#            else:
-#                df.to_csv(input_csv_file)
+    input_thread.join()
+    [p.join() for p in p_list]
 
     # Calculate the elapsed time
     elapsed_time = time.time() - time0
